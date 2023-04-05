@@ -5,6 +5,7 @@ from __future__ import division
 
 from datetime import datetime, timezone, timedelta
 import itertools
+from inspect import signature
 import logging
 import os
 import socket
@@ -79,6 +80,14 @@ def get_expected_requests(ca, ds, serverid):
             dogtag_reqs = itertools.chain(dogtag_reqs,
                                           kra.tracking_reqs.items())
         for nick, profile in dogtag_reqs:
+            if profile in ('caSignedLogCert', 'caOCSPCert',
+                           'caSubsystemCert', 'caCACert',
+                           'caAuditSigningCert', 'caTransportCert',
+                           'caStorageCert'):
+                token = ca.token_name
+            else:
+                token = None
+
             req = {
                 'cert-database': paths.PKI_TOMCAT_ALIAS_DIR,
                 'cert-nickname': nick,
@@ -88,6 +97,8 @@ def get_expected_requests(ca, ds, serverid):
                     (template % 'renew_ca_cert "{}"'.format(nick)),
                 'template-profile': profile,
             }
+            if token and token != 'internal':
+                req['key-token'] = token
             requests.append(req)
     else:
         logger.debug('CA is not configured, skipping CA tracking')
@@ -164,6 +175,44 @@ def get_expected_requests(ca, ds, serverid):
             )
 
     return requests
+
+
+def expected_token(token_name, certmonger_token):
+    """The value is stored in two places, do some sanity checking"""
+    if token_name != str(certmonger_token):
+        logger.debug(
+            "The IPA token %s doesn't match the certmonger token "
+            "%s.", token_name, certmonger_token
+        )
+        return False
+
+    return True
+
+
+def get_token_password(hsm_enabled, token):
+    if not hsm_enabled:
+        return None
+
+    with open(paths.PKI_TOMCAT_PASSWORD_CONF, "r") as passfile:
+        contents = passfile.readlines()
+
+    for line in contents:
+        data = line.split('=', 1)
+        if data[0] == 'hardware-' + token:
+            return data[1]
+
+    return None
+
+
+def get_token_password_file(hsm_enabled, token):
+    """The CA contains the list of HSM passwords, find ours"""
+    pwdfile = None
+    token_pw = get_token_password(hsm_enabled, token)
+
+    if hsm_enabled and token_pw:
+        pwdfile = ipautil.write_tmp_file(token_pw)
+
+    return pwdfile
 
 
 def get_dogtag_cert_password():
@@ -280,12 +329,27 @@ class IPACertfileExpirationCheck(IPAPlugin):
                                      'file \'{certfile}\': {error}')
                     continue
             elif store == 'NSSDB':
+                token = request.prop_if.Get(certmonger.DBUS_CM_REQUEST_IF,
+                                            'key-token')
                 nickname = str(request.prop_if.Get(
                                certmonger.DBUS_CM_REQUEST_IF, 'key_nickname'))
+                if token and expected_token(self.ca.token_name, token):
+                    nickname = '{}:{}'.format(token, nickname)
                 dbdir = str(request.prop_if.Get(
                             certmonger.DBUS_CM_REQUEST_IF, 'cert_database'))
+
+                pwd_file = get_token_password_file(self.ca.hsm_enabled,
+                                                   token)
+
                 try:
-                    db = certdb.NSSDatabase(dbdir)
+                    if 'pwd_file' in signature(certdb.NSSDatabase).parameters:
+                        # pylint: disable=unexpected-keyword-arg
+                        db = certdb.NSSDatabase(
+                            dbdir, token=token,
+                            pwd_file=pwd_file.name if pwd_file else None)
+                    else:
+                        # Fall back to older API
+                        db = certdb.NSSDatabase(dbdir)
                 except Exception as e:
                     yield Result(self, constants.ERROR,
                                  key=id,
@@ -525,31 +589,51 @@ class IPACertDNSSAN(IPAPlugin):
 @registry
 class IPACertNSSTrust(IPAPlugin):
     """Compare the NSS trust for the CA certs to a known good value"""
+
     @duration
     def check(self):
+        if not self.ca.is_configured():
+            logger.debug('CA is not configured, skipping NSS trust check')
+            return
+
+        if self.ca.hsm_enabled:
+            token = self.ca.token_name + ":"
+        else:
+            token = ""
+
         expected_trust = {
-            'ocspSigningCert cert-pki-ca': 'u,u,u',
-            'subsystemCert cert-pki-ca': 'u,u,u',
-            'auditSigningCert cert-pki-ca': 'u,u,Pu',
+            f'{token}ocspSigningCert cert-pki-ca': 'u,u,u',
+            f'{token}subsystemCert cert-pki-ca': 'u,u,u',
+            f'{token}auditSigningCert cert-pki-ca': 'u,u,Pu',
             'Server-Cert cert-pki-ca': 'u,u,u',
         }
         kra = krainstance.KRAInstance(api.env.realm)
         if kra.is_installed():
             kra_trust = {
-                'transportCert cert-pki-kra': 'u,u,u',
-                'storageCert cert-pki-kra': 'u,u,u',
-                'auditSigningCert cert-pki-kra': 'u,u,Pu',
+                f'{token}transportCert cert-pki-kra': 'u,u,u',
+                f'{token}storageCert cert-pki-kra': 'u,u,u',
+                f'{token}auditSigningCert cert-pki-kra': 'u,u,Pu',
             }
             expected_trust.update(kra_trust)
 
-        if not self.ca.is_configured():
-            logger.debug('CA is not configured, skipping NSS trust check')
-            return
+        db = certdb.NSSDatabase(paths.PKI_TOMCAT_ALIAS_DIR)
+        certlist = db.list_certs()
+        if token:
+            token = token[:-1]  # Strip off trailing colon
 
-        db = certs.CertDB(api.env.realm, paths.PKI_TOMCAT_ALIAS_DIR)
-        for nickname, _trust_flags in db.list_certs():
+            pwd_file = get_token_password_file(self.ca.hsm_enabled,
+                                               token)
+
+            # pylint: disable=unexpected-keyword-arg
+            db = certdb.NSSDatabase(
+                paths.PKI_TOMCAT_ALIAS_DIR, token=token,
+                pwd_file=pwd_file.name if pwd_file else None)
+
+            certlist += db.list_certs()
+
+        for nickname, _trust_flags in certlist:
             flags = certdb.unparse_trust_flags(_trust_flags)
-            if nickname.startswith('caSigningCert cert-pki-ca'):
+            if nickname == f'{token}caSigningCert cert-pki-ca':
                 expected = 'CTu,Cu,Cu'
             else:
                 try:
@@ -706,7 +790,7 @@ class IPADogtagCertsMatchCheck(IPAPlugin):
     @duration
     def check(self):
         if not self.ca.is_configured():
-            logger.debug('CA is not configured, skipping connectivity check')
+            logger.debug('CA is not configured, skipping match check')
             return
 
         def match_ldap_nss_cert(plugin, ldap, db, cert_dn, attr, cert_nick):
@@ -761,9 +845,21 @@ class IPADogtagCertsMatchCheck(IPAPlugin):
                                       '{dbdir} does not match entry in LDAP'))
             return all_ok
 
-        db = certs.CertDB(api.env.realm, paths.PKI_TOMCAT_ALIAS_DIR)
+        if self.ca.hsm_enabled:
+            token = self.ca.token_name + ':'
+        else:
+            token = ''
+        pwd_file = get_token_password_file(self.ca.hsm_enabled,
+                                           self.ca.token_name)
+        if 'pwd_file' in signature(certs.CertDB).parameters:
+            # pylint: disable=unexpected-keyword-arg
+            db = certs.CertDB(api.env.realm, paths.PKI_TOMCAT_ALIAS_DIR,
+                              pwd_file=pwd_file.name if pwd_file else None)
+        else:
+            # Fall back to older API
+            db = certs.CertDB(api.env.realm, paths.PKI_TOMCAT_ALIAS_DIR)
         dn = DN('uid=pkidbuser,ou=people,o=ipaca')
-        subsystem_nick = 'subsystemCert cert-pki-ca'
+        subsystem_nick = f'{token}subsystemCert cert-pki-ca'
         subsystem_ok = yield from match_ldap_nss_cert(self, self.conn,
                                                       db, dn,
                                                       'userCertificate',
@@ -771,7 +867,7 @@ class IPADogtagCertsMatchCheck(IPAPlugin):
         dn = DN('cn=%s IPA CA' % api.env.realm,
                 'cn=certificates,cn=ipa,cn=etc',
                 api.env.basedn)
-        casigning_nick = 'caSigningCert cert-pki-ca'
+        casigning_nick = f'{token}caSigningCert cert-pki-ca'
         casigning_ok = yield from match_ldap_nss_cert(self, self.conn,
                                                       db, dn, 'CACertificate',
                                                       casigning_nick)
@@ -779,11 +875,11 @@ class IPADogtagCertsMatchCheck(IPAPlugin):
         config = api.Command.config_show()
         subject_base = config['result']['ipacertificatesubjectbase'][0]
         expected_nicks_subjects = {
-            'ocspSigningCert cert-pki-ca':
+            f'{token}ocspSigningCert cert-pki-ca':
                 f'CN=OCSP Subsystem,{subject_base}',
-            'subsystemCert cert-pki-ca':
+            f'{token}subsystemCert cert-pki-ca':
                 f'CN=CA Subsystem,{subject_base}',
-            'auditSigningCert cert-pki-ca':
+            f'{token}auditSigningCert cert-pki-ca':
                 f'CN=CA Audit,{subject_base}',
             'Server-Cert cert-pki-ca':
                 f'CN={api.env.host},{subject_base}',
@@ -792,11 +888,11 @@ class IPADogtagCertsMatchCheck(IPAPlugin):
         kra = krainstance.KRAInstance(api.env.realm)
         if kra.is_installed():
             kra_expected_nicks_subjects = {
-                'transportCert cert-pki-kra':
+                f'{token}transportCert cert-pki-kra':
                     f'CN=KRA Transport Certificate,{subject_base}',
-                'storageCert cert-pki-kra':
+                f'{token}storageCert cert-pki-kra':
                     f'CN=KRA Storage Certificate,{subject_base}',
-                'auditSigningCert cert-pki-kra':
+                f'{token}auditSigningCert cert-pki-kra':
                     f'CN=KRA Audit,{subject_base}',
             }
             expected_nicks_subjects.update(kra_expected_nicks_subjects)
@@ -1021,7 +1117,16 @@ def check_agent(plugin, base_dn, agent_type):
             return
         ra_desc = raw_desc[0]
         ra_certs = entry.get('usercertificate')
-        if ra_desc != description:
+        (_version, exp_serial, exp_issuer, exp_subject) = \
+            ra_desc.split(';')
+        matched = all(
+            [
+                str(serial_number) == exp_serial,
+                DN(issuer) == DN(exp_issuer),
+                DN(subject) == DN(exp_subject),
+            ]
+        )
+        if not matched:
             yield Result(plugin, constants.ERROR,
                          key='description_mismatch',
                          expected=description,
@@ -1122,6 +1227,8 @@ class IPACertRevocation(IPAPlugin):
             logger.debug('CA is not configured, skipping revocation check')
             return
         requests = get_expected_requests(self.ca, self.ds, self.serverid)
+        pwd_file = get_token_password_file(self.ca.hsm_enabled,
+                                           self.ca.token_name)
         for request in requests:
             id = certmonger.get_request_id(request)
             if request.get('cert-file') is not None:
@@ -1138,9 +1245,20 @@ class IPACertRevocation(IPAPlugin):
                     continue
             elif request.get('cert-database') is not None:
                 nickname = request.get('cert-nickname')
+                token = request.get('key-token')
+                if token == 'internal':
+                    token = None
                 dbdir = request.get('cert-database')
                 try:
-                    db = certdb.NSSDatabase(dbdir)
+                    if 'pwd_file' in signature(certdb.NSSDatabase).parameters:
+                        # pylint: disable=unexpected-keyword-arg
+                        db = certdb.NSSDatabase(
+                            dbdir, token=token,
+                            pwd_file=pwd_file.name if pwd_file else None
+                        )
+                    else:
+                        # Fall back to older API that doesn't support tokens
+                        db = certdb.NSSDatabase(dbdir)
                 except Exception as e:
                     yield Result(self, constants.ERROR,
                                  key=id,
@@ -1149,6 +1267,8 @@ class IPACertRevocation(IPAPlugin):
                                  msg='Unable to open NSS database {dbdir}: '
                                      '{error}')
                     continue
+                if token:
+                    nickname = f'{token}:{nickname}'
                 try:
                     cert = db.get_cert(nickname)
                 except Exception as e:
